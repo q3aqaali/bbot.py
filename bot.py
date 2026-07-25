@@ -8,9 +8,9 @@ import yt_dlp
 import os
 
 # 🔑 البيانات المضمنة
-BOT_TOKEN = "8866783597:AAFnY9q0EY9QynpWAPRwE3JgBcS1QSa5ypU"
+BOT_TOKEN = "8883675543:AAHwlD_oNlOBqE0JHm_6Cvbiqkqt13FuBoA"
 TMDB_API_KEY = "901e0d7267520343d8141db3d734267f"
-ADMIN_ID = 8562738250
+ADMIN_ID = 8897624468
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
