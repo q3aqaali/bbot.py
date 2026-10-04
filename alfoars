@@ -1,1 +1,1688 @@
+import html
+import re
+import sqlite3
+import threading
 
+import telebot
+from telebot import types
+
+# =========================================================
+# إعدادات البوت
+# =========================================================
+
+BOT_TOKEN = "8916391040:AAEVpOfg3H0uTKTL_YI8ojY6wfmGkT6N-pU"
+
+# آيدي الأدمن
+ADMIN_ID = 8853607842
+
+# =========================================================
+# تشغيل البوت
+# =========================================================
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# =========================================================
+# قاعدة البيانات
+# =========================================================
+
+db = sqlite3.connect("fawaris_team.db", check_same_thread=False)
+db.row_factory = sqlite3.Row
+db_lock = threading.RLock()
+
+
+def q_all(query, params=()):
+    with db_lock:
+        return db.execute(query, params).fetchall()
+
+
+def q_one(query, params=()):
+    with db_lock:
+        return db.execute(query, params).fetchone()
+
+
+def q_exec(query, params=()):
+    with db_lock:
+        cur = db.execute(query, params)
+        db.commit()
+        return cur
+
+
+def add_column_if_missing(table, column, definition):
+    columns = [row["name"] for row in q_all(f"PRAGMA table_info({table})")]
+    if column not in columns:
+        q_exec(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+# جدول الطلبات
+q_exec("""
+CREATE TABLE IF NOT EXISTS applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    full_name TEXT,
+    nickname TEXT,
+    band_join TEXT,
+    age TEXT,
+    is_learned TEXT,
+    tg_name TEXT,
+    status TEXT DEFAULT 'pending'
+)
+""")
+
+# ترقية قاعدة البيانات القديمة (إن كانت موجودة مسبقاً)
+add_column_if_missing("applications", "nickname", "TEXT")
+add_column_if_missing("applications", "is_learned", "TEXT")
+add_column_if_missing("applications", "tg_name", "TEXT")
+
+# جدول الإعدادات
+q_exec("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+
+# جدول مستخدمي البوت (لإشعار الأدمن بالمستخدمين الجدد)
+q_exec("""
+CREATE TABLE IF NOT EXISTS fw_users (
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT,
+    username TEXT,
+    joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+# من قدّم سابقاً لا يُعتبر مستخدماً جديداً
+q_exec("""
+INSERT OR IGNORE INTO fw_users (user_id, username, first_name)
+SELECT user_id, MAX(username), MAX(full_name)
+FROM applications
+GROUP BY user_id
+""")
+
+# ربط رسائل الدعم (رسالة الأدمن -> المستخدم) للرد بالـ Reply
+q_exec("""
+CREATE TABLE IF NOT EXISTS fw_support_map (
+    admin_msg_id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL
+)
+""")
+
+# قنوات الاشتراك الإجباري
+q_exec("""
+CREATE TABLE IF NOT EXISTS fw_force_channels (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    link TEXT
+)
+""")
+
+# =========================================================
+# حالات مؤقتة
+# =========================================================
+
+user_data = {}       # حالة نموذج التقديم لكل مستخدم
+support_mode = set()  # المستخدمون الموجودون في محادثة الدعم
+admin_state = {}     # حالة الأدمن (إدخال رابط، إضافة قناة، رد ...)
+
+ALL_CONTENT_TYPES = [
+    "text", "photo", "video", "document", "audio",
+    "voice", "sticker", "video_note", "animation"
+]
+
+AR_DIGITS = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
+    "01234567890123456789"
+)
+
+# =========================================================
+# دوال مساعدة
+# =========================================================
+
+
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def user_full_name(user):
+    name = user.first_name or ""
+    if user.last_name:
+        name += " " + user.last_name
+    return name.strip() or "بدون اسم"
+
+
+def user_link(user_id, name):
+    return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
+
+
+def clean(text, limit=60):
+    return " ".join(text.split())[:limit]
+
+
+def parse_number(text):
+    value = text.strip().translate(AR_DIGITS)
+    if re.fullmatch(r"[0-9]{1,6}", value):
+        return value
+    return None
+
+
+def get_setting(key):
+    row = q_one("SELECT value FROM settings WHERE key = ?", (key,))
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    q_exec(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, value)
+    )
+
+
+def has_pending_application(user_id):
+    return q_one(
+        "SELECT id FROM applications WHERE user_id = ? AND status = 'pending'",
+        (user_id,)
+    ) is not None
+
+
+def has_any_application(user_id):
+    return q_one(
+        "SELECT id FROM applications WHERE user_id = ? LIMIT 1",
+        (user_id,)
+    ) is not None
+
+
+def register_user(user):
+    """يرجع True إذا كان المستخدم جديداً."""
+    cur = q_exec(
+        "INSERT OR IGNORE INTO fw_users (user_id, first_name, username) VALUES (?, ?, ?)",
+        (user.id, user_full_name(user), user.username)
+    )
+    return cur.rowcount == 1
+
+
+def get_profile_photo(user_id):
+    try:
+        photos = bot.get_user_profile_photos(user_id, limit=1)
+        if photos.total_count > 0:
+            return photos.photos[0][-1].file_id
+    except Exception as e:
+        print(f"[profile photo] {e}")
+    return None
+
+
+def profile_button(user_id):
+    return types.InlineKeyboardButton(
+        "👤 الملف الشخصي",
+        url=f"tg://user?id={user_id}"
+    )
+
+
+def send_admin_card(text, build_markup, photo_id=None):
+    """
+    يرسل بطاقة للأدمن. إذا رفض تيليجرام زر الملف الشخصي
+    (بسبب خصوصية المستخدم) يعيد الإرسال بدونه.
+    """
+    for with_profile in (True, False):
+        markup = build_markup(with_profile)
+        try:
+            if photo_id:
+                return bot.send_photo(
+                    ADMIN_ID, photo_id, caption=text, reply_markup=markup
+                )
+            return bot.send_message(ADMIN_ID, text, reply_markup=markup)
+        except Exception as e:
+            print(f"[admin card] {e}")
+
+    if photo_id:
+        try:
+            return bot.send_message(
+                ADMIN_ID, text, reply_markup=build_markup(False)
+            )
+        except Exception as e:
+            print(f"[admin card fallback] {e}")
+
+    return None
+
+
+def remove_markup(call):
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=None
+        )
+    except Exception:
+        pass
+
+
+def is_admin_call(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(
+            call.id, "❌ ليس لديك صلاحية.", show_alert=True
+        )
+        return False
+    return True
+
+
+# =========================================================
+# الاشتراك الإجباري
+# =========================================================
+
+
+def get_force_channels():
+    return q_all("SELECT chat_id, title, link FROM fw_force_channels")
+
+
+def get_unjoined(user_id):
+    missing = []
+
+    for channel in get_force_channels():
+        try:
+            member = bot.get_chat_member(channel["chat_id"], user_id)
+
+            if member.status in ("left", "kicked"):
+                missing.append(channel)
+            elif (
+                member.status == "restricted"
+                and getattr(member, "is_member", True) is False
+            ):
+                missing.append(channel)
+
+        except Exception as e:
+            # تعذر التحقق (مثلاً البوت ليس أدمن) — لا نمنع المستخدم
+            print(f"[force sub] {channel['chat_id']}: {e}")
+
+    return missing
+
+
+def ensure_subscribed(user_id):
+    """يرجع True إذا كان المستخدم مشتركاً (أو لا توجد قنوات إجبارية)."""
+    if user_id == ADMIN_ID:
+        return True
+
+    missing = get_unjoined(user_id)
+
+    if not missing:
+        return True
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for channel in missing:
+        markup.add(
+            types.InlineKeyboardButton(
+                f"📢 {channel['title']}",
+                url=channel["link"]
+            )
+        )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ تحققت من الاشتراك",
+            callback_data="check_sub",
+            style="success"
+        )
+    )
+
+    bot.send_message(
+        user_id,
+        """
+<b>⚠️ الاشتراك الإجباري</b>
+
+━━━━━━━━━━━━━━━━━━
+
+للاستمرار في استخدام البوت يجب عليك
+الاشتراك في القنوات التالية، ثم اضغط
+على زر التحقق.
+
+━━━━━━━━━━━━━━━━━━
+""",
+        reply_markup=markup
+    )
+
+    return False
+
+
+# =========================================================
+# القوائم والرسائل
+# =========================================================
+
+
+def main_menu(user_id):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    # زر شفاف (بدون لون)
+    markup.add(
+        types.InlineKeyboardButton(
+            "⚔️ التقديم على تيم الفوارس",
+            callback_data="apply"
+        )
+    )
+
+    # زر الدعم يظهر لمن قدّم طلباً
+    if has_any_application(user_id):
+        markup.add(
+            types.InlineKeyboardButton(
+                "💬 تواصل مع الدعم",
+                callback_data="support"
+            )
+        )
+
+    return markup
+
+
+def support_button_markup():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "💬 تواصل مع الدعم",
+            callback_data="support"
+        )
+    )
+    return markup
+
+
+def send_welcome(chat_id, user):
+    text = (
+        f"اهلا عزيزي <b>{esc(user_full_name(user))}</b> "
+        f"للتقديم الى تيم الفوارس اضغط على الزر ادناه\n\n"
+        f"<b>id:</b> <code>{user.id}</code>"
+    )
+
+    bot.send_message(chat_id, text, reply_markup=main_menu(user.id))
+
+
+def notify_new_user(user):
+    username = f"@{esc(user.username)}" if user.username else "لا يوجد"
+
+    text = f"""
+<b>🆕 مستخدم جديد استخدم البوت</b>
+
+━━━━━━━━━━━━━━━━━━
+
+<b>الاسم:</b> {user_link(user.id, user_full_name(user))}
+
+<b>Username:</b> {username}
+
+<b>Telegram ID:</b> <code>{user.id}</code>
+"""
+
+    def build_markup(with_profile):
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        if with_profile:
+            markup.add(profile_button(user.id))
+        return markup
+
+    send_admin_card(text, build_markup)
+
+
+# =========================================================
+# /start
+# =========================================================
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+
+    if message.chat.type != "private":
+        return
+
+    user = message.from_user
+
+    # إعادة ضبط أي عملية غير مكتملة
+    user_data.pop(user.id, None)
+    support_mode.discard(user.id)
+
+    if user.id == ADMIN_ID:
+        admin_state.pop(ADMIN_ID, None)
+
+    # إشعار الأدمن بالمستخدم الجديد (مرة واحدة فقط)
+    if register_user(user) and user.id != ADMIN_ID:
+        try:
+            notify_new_user(user)
+        except Exception as e:
+            print(f"[new user notify] {e}")
+
+    if not ensure_subscribed(user.id):
+        return
+
+    send_welcome(message.chat.id, user)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def check_subscription(call):
+
+    user = call.from_user
+
+    if get_unjoined(user.id):
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ لم تشترك في جميع القنوات بعد.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id)
+
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+    send_welcome(call.message.chat.id, user)
+
+
+# =========================================================
+# بدء التقديم
+# =========================================================
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "apply")
+def start_application(call):
+
+    user_id = call.from_user.id
+
+    if has_pending_application(user_id):
+        bot.answer_callback_query(
+            call.id,
+            "لديك طلب قيد المراجعة بالفعل.",
+            show_alert=True
+        )
+        return
+
+    if user_id in user_data:
+        bot.answer_callback_query(
+            call.id,
+            "أنت داخل نموذج التقديم بالفعل.",
+            show_alert=True
+        )
+        return
+
+    if not ensure_subscribed(user_id):
+        bot.answer_callback_query(call.id)
+        return
+
+    support_mode.discard(user_id)
+
+    user_data[user_id] = {
+        "step": 1,
+        "full_name": None,
+        "nickname": None,
+        "band_join": None,
+        "age": None,
+        "is_learned": None
+    }
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        user_id,
+        """
+<b>⚔️ بدأ التقديم</b>
+
+━━━━━━━━━━━━━━━━━━
+
+<b>السؤال 1 من 5:</b>
+
+ما اسمك؟
+
+أرسل إجابتك الآن.
+"""
+    )
+
+
+# =========================================================
+# إجابات التقديم
+# =========================================================
+
+
+def handle_application_message(message):
+
+    user_id = message.from_user.id
+    data = user_data[user_id]
+    step = data["step"]
+
+    if message.content_type != "text":
+        bot.send_message(user_id, "⚠️ أرسل إجابتك كنص فقط.")
+        return
+
+    text = message.text.strip()
+
+    if step == 5:
+        bot.send_message(
+            user_id,
+            "⚠️ اختر إجابتك من الأزرار الظاهرة في الرسالة السابقة."
+        )
+        return
+
+    if not text:
+        bot.send_message(user_id, "⚠️ أرسل إجابة صحيحة.")
+        return
+
+    # -----------------------------------------------------
+    # 1 - الاسم
+    # -----------------------------------------------------
+    if step == 1:
+        data["full_name"] = clean(text)
+        data["step"] = 2
+
+        bot.send_message(
+            user_id,
+            """
+<b>السؤال 2 من 5:</b>
+
+ما لقبك المشهور به؟
+
+أرسل لقبك الآن.
+"""
+        )
+        return
+
+    # -----------------------------------------------------
+    # 2 - اللقب
+    # -----------------------------------------------------
+    if step == 2:
+        data["nickname"] = clean(text)
+        data["step"] = 3
+
+        bot.send_message(
+            user_id,
+            """
+<b>السؤال 3 من 5:</b>
+
+متى انضممت إلى الباند؟
+
+⚠️ يجب إرسال رقم فقط.
+"""
+        )
+        return
+
+    # -----------------------------------------------------
+    # 3 - تاريخ الانضمام للباند (رقم)
+    # -----------------------------------------------------
+    if step == 3:
+        number = parse_number(text)
+
+        if number is None:
+            bot.send_message(
+                user_id,
+                "❌ إجابة غير صحيحة.\n\nيجب أن ترسل <b>رقماً فقط</b>، "
+                "حاول مرة أخرى."
+            )
+            return
+
+        data["band_join"] = number
+        data["step"] = 4
+
+        bot.send_message(
+            user_id,
+            """
+<b>السؤال 4 من 5:</b>
+
+ما عمرك؟
+
+⚠️ يجب إرسال رقم فقط.
+"""
+        )
+        return
+
+    # -----------------------------------------------------
+    # 4 - العمر (رقم)
+    # -----------------------------------------------------
+    if step == 4:
+        number = parse_number(text)
+
+        if number is None:
+            bot.send_message(
+                user_id,
+                "❌ إجابة غير صحيحة.\n\nيجب أن ترسل <b>رقماً فقط</b>، "
+                "حاول مرة أخرى."
+            )
+            return
+
+        if not 1 <= int(number) <= 120:
+            bot.send_message(
+                user_id,
+                "❌ العمر غير منطقي، أرسل عمرك الحقيقي."
+            )
+            return
+
+        data["age"] = number
+        data["step"] = 5
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton(
+                "متعلم",
+                callback_data="learned_yes",
+                style="success"
+            ),
+            types.InlineKeyboardButton(
+                "غير متعلم",
+                callback_data="learned_no",
+                style="danger"
+            )
+        )
+
+        bot.send_message(
+            user_id,
+            """
+<b>السؤال 5 من 5:</b>
+
+هل انت متعلم او جديد؟
+""",
+            reply_markup=markup
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data in ("learned_yes", "learned_no")
+)
+def learned_answer(call):
+
+    user = call.from_user
+    data = user_data.get(user.id)
+
+    if not data or data.get("step") != 5:
+        bot.answer_callback_query(
+            call.id,
+            "انتهت جلسة التقديم، أرسل /start وابدأ من جديد.",
+            show_alert=True
+        )
+        return
+
+    if has_pending_application(user.id):
+        bot.answer_callback_query(
+            call.id,
+            "لديك طلب قيد المراجعة بالفعل.",
+            show_alert=True
+        )
+        return
+
+    user_data.pop(user.id, None)
+
+    data["is_learned"] = "متعلم" if call.data == "learned_yes" else "غير متعلم"
+
+    bot.answer_callback_query(call.id)
+    remove_markup(call)
+
+    finalize_application(user, data)
+
+
+# =========================================================
+# حفظ الطلب وإرساله للأدمن
+# =========================================================
+
+
+def application_text(app, status_text):
+
+    username = f"@{esc(app['username'])}" if app["username"] else "لا يوجد"
+    tg_name = app["tg_name"] or app["full_name"] or "بدون اسم"
+
+    return f"""
+<b>⚔️ طلب تقديم #{app['id']}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+<b>👤 معلومات الحساب</b>
+
+<b>الاسم في تيليجرام:</b> {user_link(app['user_id'], tg_name)}
+<b>Username:</b> {username}
+<b>Telegram ID:</b> <code>{app['user_id']}</code>
+
+━━━━━━━━━━━━━━━━━━
+
+<b>📝 إجابات المتقدم</b>
+
+<b>الاسم:</b> {esc(app['full_name'] or '-')}
+<b>اللقب:</b> {esc(app['nickname'] or '-')}
+<b>الانضمام للباند:</b> {esc(app['band_join'] or '-')}
+<b>العمر:</b> {esc(app['age'] or '-')}
+<b>متعلم أو جديد (متعلم/غير متعلم):</b> {esc(app['is_learned'] or '-')}
+
+━━━━━━━━━━━━━━━━━━
+
+<b>الحالة:</b> {status_text}
+"""
+
+
+def send_application_card(application_id):
+
+    app = q_one("SELECT * FROM applications WHERE id = ?", (application_id,))
+
+    if not app:
+        return
+
+    def build_markup(with_profile):
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton(
+                "✅ موافقة",
+                callback_data=f"approve_{application_id}",
+                style="success"
+            ),
+            types.InlineKeyboardButton(
+                "❌ رفض",
+                callback_data=f"reject_{application_id}",
+                style="danger"
+            )
+        )
+        if with_profile:
+            markup.row(profile_button(app["user_id"]))
+        return markup
+
+    send_admin_card(
+        application_text(app, "⏳ قيد المراجعة"),
+        build_markup,
+        photo_id=get_profile_photo(app["user_id"])
+    )
+
+
+def finalize_application(user, data):
+
+    cur = q_exec("""
+        INSERT INTO applications
+        (user_id, username, full_name, nickname, band_join, age,
+         is_learned, tg_name, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    """, (
+        user.id,
+        user.username,
+        data["full_name"],
+        data["nickname"],
+        data["band_join"],
+        data["age"],
+        data["is_learned"],
+        clean(user_full_name(user), 64)
+    ))
+
+    application_id = cur.lastrowid
+
+    # رسالة المستخدم + زر الدعم
+    bot.send_message(
+        user.id,
+        """
+<b>✅ تم إرسال طلبك بنجاح</b>
+
+━━━━━━━━━━━━━━━━━━
+
+تم استلام طلب التقديم الخاص بك
+وإرساله إلى إدارة تيم الفوارس.
+
+سيتم مراجعة طلبك وإبلاغك بالنتيجة
+بعد اتخاذ القرار.
+
+<b>يرجى الانتظار.</b>
+
+━━━━━━━━━━━━━━━━━━
+""",
+        reply_markup=support_button_markup()
+    )
+
+    send_application_card(application_id)
+
+
+# =========================================================
+# الدعم (محادثة المستخدم مع الأدمن)
+# =========================================================
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "support")
+def start_support(call):
+
+    user_id = call.from_user.id
+
+    if user_id in user_data:
+        bot.answer_callback_query(
+            call.id,
+            "أكمل نموذج التقديم أولاً.",
+            show_alert=True
+        )
+        return
+
+    if not ensure_subscribed(user_id):
+        bot.answer_callback_query(call.id)
+        return
+
+    support_mode.add(user_id)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "❌ إنهاء المحادثة",
+            callback_data="end_support",
+            style="danger"
+        )
+    )
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        user_id,
+        """
+<b>💬 الدعم</b>
+
+━━━━━━━━━━━━━━━━━━
+
+أرسل رسالتك الآن وسيتم تحويلها
+إلى الأدمن، وسيصلك الرد هنا.
+
+━━━━━━━━━━━━━━━━━━
+""",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "end_support")
+def end_support(call):
+
+    support_mode.discard(call.from_user.id)
+
+    bot.answer_callback_query(call.id, "تم إنهاء المحادثة.")
+    remove_markup(call)
+
+
+def relay(message, target_id, header, markup=None):
+    """
+    يحوّل رسالة إلى target_id بالشكل:
+    header + الرسالة: ...
+    ويرجع قائمة بآيديات الرسائل المرسلة.
+    """
+    sent_ids = []
+
+    if message.content_type == "text" and len(message.text) <= 3500:
+        sent = bot.send_message(
+            target_id,
+            f"{header}\n\n<b>الرسالة:</b>\n{esc(message.text)}",
+            reply_markup=markup
+        )
+        sent_ids.append(sent.message_id)
+
+    else:
+        sent = bot.send_message(
+            target_id,
+            f"{header}\n\n<b>الرسالة:</b> ⬇️",
+            reply_markup=markup
+        )
+        sent_ids.append(sent.message_id)
+
+        copied = bot.copy_message(
+            target_id,
+            message.chat.id,
+            message.message_id
+        )
+        sent_ids.append(copied.message_id)
+
+    return sent_ids
+
+
+def handle_support_message(message):
+
+    user = message.from_user
+
+    header = (
+        f"<b>📩 هذه الرسالة من</b> "
+        f"{user_link(user.id, user_full_name(user))}"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "💬 رد",
+            callback_data=f"reply_{user.id}",
+            style="primary"
+        )
+    )
+
+    try:
+        sent_ids = relay(message, ADMIN_ID, header, markup)
+    except Exception as e:
+        print(f"[support relay] {e}")
+        bot.reply_to(
+            message,
+            "⚠️ تعذر إرسال رسالتك إلى الدعم، حاول مرة أخرى لاحقاً."
+        )
+        return
+
+    for admin_msg_id in sent_ids:
+        q_exec(
+            "INSERT OR REPLACE INTO fw_support_map (admin_msg_id, user_id) "
+            "VALUES (?, ?)",
+            (admin_msg_id, user.id)
+        )
+
+    bot.reply_to(message, "✅ تم إرسال رسالتك إلى الدعم.")
+
+
+def get_support_user(admin_msg_id):
+    row = q_one(
+        "SELECT user_id FROM fw_support_map WHERE admin_msg_id = ?",
+        (admin_msg_id,)
+    )
+    return row["user_id"] if row else None
+
+
+def send_admin_reply(message, target_id):
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "💬 الرد على الدعم",
+            callback_data="support"
+        )
+    )
+
+    try:
+        relay(
+            message,
+            target_id,
+            "<b>📩 هذه الرسالة من الأدمن</b>",
+            markup
+        )
+        bot.reply_to(message, "✅ تم إرسال ردك إلى المستخدم.")
+
+    except Exception as e:
+        bot.reply_to(
+            message,
+            f"⚠️ تعذر إرسال الرد إلى المستخدم.\n\n"
+            f"<code>{esc(e)}</code>"
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("reply_")
+)
+def admin_reply_button(call):
+
+    if not is_admin_call(call):
+        return
+
+    target_id = int(call.data.split("_", 1)[1])
+
+    admin_state[ADMIN_ID] = {"action": "reply", "user_id": target_id}
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        ADMIN_ID,
+        """
+💬 أرسل ردك الآن وسيصل إلى المستخدم.
+
+(أو اعمل Reply على رسالة المستخدم مباشرة)
+للإلغاء أرسل /admin
+"""
+    )
+
+
+# =========================================================
+# الموافقة / الرفض
+# =========================================================
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith(("approve_", "reject_"))
+)
+def decide_application(call):
+
+    if not is_admin_call(call):
+        return
+
+    action, raw_id = call.data.split("_", 1)
+    application_id = int(raw_id)
+
+    app = q_one("""
+        SELECT user_id, full_name
+        FROM applications
+        WHERE id = ? AND status = 'pending'
+    """, (application_id,))
+
+    if not app:
+        bot.answer_callback_query(
+            call.id,
+            "الطلب غير موجود أو تمت معالجته مسبقاً.",
+            show_alert=True
+        )
+        return
+
+    user_id = app["user_id"]
+    full_name = esc(app["full_name"] or "")
+
+    if action == "approve":
+
+        group_link = get_setting("group_link")
+
+        if not group_link:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ يجب تحديد رابط المجموعة أولاً من لوحة الأدمن.",
+                show_alert=True
+            )
+            return
+
+        new_status = "approved"
+
+    else:
+        new_status = "rejected"
+
+    cur = q_exec(
+        "UPDATE applications SET status = ? WHERE id = ? AND status = 'pending'",
+        (new_status, application_id)
+    )
+
+    if cur.rowcount == 0:
+        bot.answer_callback_query(
+            call.id,
+            "الطلب تمت معالجته مسبقاً.",
+            show_alert=True
+        )
+        return
+
+    remove_markup(call)
+
+    if action == "approve":
+
+        try:
+            bot.send_message(
+                user_id,
+                f"""
+<b>🎉 تمت الموافقة على طلبك!</b>
+
+━━━━━━━━━━━━━━━━━━
+
+أهلاً بك <b>{full_name}</b>.
+
+تمت الموافقة على طلب انضمامك
+إلى <b>تيم الفوارس</b> بنجاح.
+
+يمكنك الآن الانضمام إلى المجموعة
+من خلال الرابط التالي:
+
+{esc(group_link)}
+
+━━━━━━━━━━━━━━━━━━
+
+<b>أهلاً بك بين الفوارس.</b>
+"""
+            )
+
+        except Exception as e:
+            bot.send_message(
+                ADMIN_ID,
+                f"""
+⚠️ تمت الموافقة على الطلب #{application_id}
+
+لكن تعذر إرسال رسالة القبول إلى المستخدم.
+
+<b>الخطأ:</b>
+
+<code>{esc(e)}</code>
+"""
+            )
+
+        bot.answer_callback_query(call.id, "✅ تمت الموافقة على الطلب.")
+
+    else:
+
+        try:
+            bot.send_message(
+                user_id,
+                f"""
+<b>❌ لم يتم قبول طلبك</b>
+
+━━━━━━━━━━━━━━━━━━
+
+عذراً <b>{full_name}</b>.
+
+بعد مراجعة طلبك من قبل إدارة
+تيم الفوارس، لم تتم الموافقة
+على طلب الانضمام في الوقت الحالي.
+
+يمكنك التواصل مع الإدارة
+للاستفسار.
+
+━━━━━━━━━━━━━━━━━━
+"""
+            )
+
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, "❌ تم رفض الطلب.")
+
+
+# =========================================================
+# لوحة الأدمن
+# =========================================================
+
+
+@bot.message_handler(commands=["admin"])
+def admin_panel(message):
+
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(
+            message,
+            "❌ ليس لديك صلاحية الدخول إلى لوحة الإدارة."
+        )
+        return
+
+    admin_state.pop(ADMIN_ID, None)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📋 الطلبات المعلقة",
+            callback_data="pending_applications",
+            style="primary"
+        ),
+        types.InlineKeyboardButton(
+            "🔗 تعيين رابط المجموعة",
+            callback_data="set_group",
+            style="primary"
+        ),
+        types.InlineKeyboardButton(
+            "📢 الاشتراك الإجباري",
+            callback_data="force_sub_menu",
+            style="primary"
+        ),
+        types.InlineKeyboardButton(
+            "📊 الإحصائيات",
+            callback_data="stats",
+            style="primary"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        """
+<b>⚙️ لوحة إدارة تيم الفوارس</b>
+
+━━━━━━━━━━━━━━━━━━
+
+اختر العملية التي تريد تنفيذها:
+
+📋 مراجعة طلبات التقديم
+🔗 إدارة رابط المجموعة
+📢 إدارة الاشتراك الإجباري
+📊 عرض الإحصائيات
+
+━━━━━━━━━━━━━━━━━━
+""",
+        reply_markup=markup
+    )
+
+
+# =========================================================
+# الطلبات المعلقة
+# =========================================================
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "pending_applications"
+)
+def pending_applications(call):
+
+    if not is_admin_call(call):
+        return
+
+    applications = q_all("""
+        SELECT id FROM applications
+        WHERE status = 'pending'
+        ORDER BY id DESC
+    """)
+
+    bot.answer_callback_query(call.id)
+
+    if not applications:
+        bot.send_message(
+            ADMIN_ID,
+            "<b>📭 لا توجد طلبات معلقة حالياً.</b>"
+        )
+        return
+
+    bot.send_message(
+        ADMIN_ID,
+        f"""
+<b>📋 الطلبات المعلقة</b>
+
+عدد الطلبات: <b>{len(applications)}</b>
+"""
+    )
+
+    for app in applications:
+        send_application_card(app["id"])
+
+
+# =========================================================
+# تعيين رابط المجموعة
+# =========================================================
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "set_group")
+def set_group_start(call):
+
+    if not is_admin_call(call):
+        return
+
+    bot.answer_callback_query(call.id)
+
+    admin_state[ADMIN_ID] = {"action": "set_group"}
+
+    bot.send_message(
+        ADMIN_ID,
+        """
+<b>🔗 تعيين رابط المجموعة</b>
+
+━━━━━━━━━━━━━━━━━━
+
+أرسل الآن رابط مجموعة تيم الفوارس.
+
+مثال:
+
+<code>https://t.me/YourGroup</code>
+
+━━━━━━━━━━━━━━━━━━
+"""
+    )
+
+
+# =========================================================
+# الاشتراك الإجباري (لوحة الأدمن)
+# =========================================================
+
+
+def send_force_sub_menu():
+
+    channels = get_force_channels()
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ إضافة قناة / مجموعة",
+            callback_data="add_channel",
+            style="primary"
+        )
+    )
+
+    for channel in channels:
+        markup.add(
+            types.InlineKeyboardButton(
+                f"🗑 حذف: {channel['title']}",
+                callback_data=f"delch_{channel['chat_id']}",
+                style="danger"
+            )
+        )
+
+    if channels:
+        lines = "\n".join(
+            f"• {esc(channel['title'])}" for channel in channels
+        )
+    else:
+        lines = "لا توجد قنوات مضافة (الاشتراك الإجباري غير مفعل)."
+
+    bot.send_message(
+        ADMIN_ID,
+        f"""
+<b>📢 الاشتراك الإجباري</b>
+
+━━━━━━━━━━━━━━━━━━
+
+{lines}
+
+━━━━━━━━━━━━━━━━━━
+
+⚠️ يجب أن يكون البوت <b>أدمن</b> في القناة
+أو المجموعة حتى يتمكن من التحقق من الاشتراك.
+""",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "force_sub_menu"
+)
+def force_sub_menu(call):
+
+    if not is_admin_call(call):
+        return
+
+    bot.answer_callback_query(call.id)
+    send_force_sub_menu()
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "add_channel")
+def add_channel_start(call):
+
+    if not is_admin_call(call):
+        return
+
+    bot.answer_callback_query(call.id)
+
+    admin_state[ADMIN_ID] = {"action": "add_channel"}
+
+    bot.send_message(
+        ADMIN_ID,
+        """
+<b>➕ إضافة قناة / مجموعة</b>
+
+━━━━━━━━━━━━━━━━━━
+
+أرسل يوزر القناة أو رابطها العام
+أو الآيدي الخاص بها.
+
+أمثلة:
+
+<code>@YourChannel</code>
+<code>https://t.me/YourChannel</code>
+<code>-1001234567890</code>
+
+⚠️ تأكد أن البوت أدمن فيها أولاً.
+
+━━━━━━━━━━━━━━━━━━
+"""
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("delch_")
+)
+def delete_channel(call):
+
+    if not is_admin_call(call):
+        return
+
+    chat_id = int(call.data.split("_", 1)[1])
+
+    q_exec("DELETE FROM fw_force_channels WHERE chat_id = ?", (chat_id,))
+
+    bot.answer_callback_query(call.id, "🗑 تم حذف القناة.")
+    remove_markup(call)
+    send_force_sub_menu()
+
+
+def parse_chat_ref(raw):
+
+    raw = raw.strip()
+
+    match = re.fullmatch(
+        r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/?",
+        raw
+    )
+
+    if match:
+        return "@" + match.group(1)
+
+    if re.fullmatch(r"@[A-Za-z0-9_]{4,}", raw):
+        return raw
+
+    if re.fullmatch(r"-?[0-9]+", raw):
+        return int(raw)
+
+    return None
+
+
+def save_channel(chat_id, title, link):
+    q_exec(
+        "INSERT OR REPLACE INTO fw_force_channels (chat_id, title, link) "
+        "VALUES (?, ?, ?)",
+        (chat_id, title, link)
+    )
+
+
+# =========================================================
+# رسائل الأدمن (حالات الإدخال + الرد على الدعم)
+# =========================================================
+
+
+def handle_admin_message(message):
+    """يرجع True إذا تمت معالجة الرسالة."""
+
+    state = admin_state.get(ADMIN_ID)
+
+    if state:
+
+        action = state["action"]
+
+        # ---------------- رد على مستخدم ----------------
+        if action == "reply":
+            admin_state.pop(ADMIN_ID, None)
+            send_admin_reply(message, state["user_id"])
+            return True
+
+        if message.content_type != "text":
+            bot.send_message(ADMIN_ID, "⚠️ أرسل نصاً فقط.")
+            return True
+
+        text = message.text.strip()
+
+        # ---------------- رابط المجموعة ----------------
+        if action == "set_group":
+
+            if not (
+                text.startswith("https://t.me/")
+                or text.startswith("http://t.me/")
+                or text.startswith("https://telegram.me/")
+            ):
+                bot.send_message(
+                    ADMIN_ID,
+                    """
+❌ الرابط غير صحيح.
+
+أرسل رابط تيليجرام صحيح يبدأ بـ:
+
+<code>https://t.me/</code>
+"""
+                )
+                return True
+
+            set_setting("group_link", text)
+            admin_state.pop(ADMIN_ID, None)
+
+            bot.send_message(
+                ADMIN_ID,
+                f"""
+<b>✅ تم حفظ رابط المجموعة بنجاح.</b>
+
+━━━━━━━━━━━━━━━━━━
+
+<b>الرابط الحالي:</b>
+
+{esc(text)}
+
+━━━━━━━━━━━━━━━━━━
+"""
+            )
+            return True
+
+        # ---------------- إضافة قناة ----------------
+        if action == "add_channel":
+
+            ref = parse_chat_ref(text)
+
+            if ref is None:
+                bot.send_message(
+                    ADMIN_ID,
+                    "❌ المدخل غير صحيح.\n\nأرسل يوزر القناة "
+                    "(@name) أو رابطها العام أو الآيدي الخاص بها."
+                )
+                return True
+
+            try:
+                chat = bot.get_chat(ref)
+                me = bot.get_me()
+                member = bot.get_chat_member(chat.id, me.id)
+            except Exception as e:
+                bot.send_message(
+                    ADMIN_ID,
+                    f"❌ تعذر الوصول إلى القناة.\n\n"
+                    f"تأكد أن البوت مضاف فيها.\n\n"
+                    f"<code>{esc(e)}</code>"
+                )
+                return True
+
+            if member.status not in ("administrator", "creator"):
+                bot.send_message(
+                    ADMIN_ID,
+                    "❌ البوت ليس أدمن في هذه القناة.\n\n"
+                    "ارفع البوت أدمن ثم أعد المحاولة."
+                )
+                return True
+
+            title = chat.title or str(chat.id)
+            link = None
+
+            if chat.username:
+                link = f"https://t.me/{chat.username}"
+            else:
+                try:
+                    link = bot.export_chat_invite_link(chat.id)
+                except Exception:
+                    link = None
+
+            if link:
+                save_channel(chat.id, title, link)
+                admin_state.pop(ADMIN_ID, None)
+                bot.send_message(
+                    ADMIN_ID,
+                    f"✅ تمت إضافة <b>{esc(title)}</b> "
+                    f"إلى الاشتراك الإجباري."
+                )
+                send_force_sub_menu()
+                return True
+
+            admin_state[ADMIN_ID] = {
+                "action": "add_channel_link",
+                "chat_id": chat.id,
+                "title": title
+            }
+
+            bot.send_message(
+                ADMIN_ID,
+                "🔗 هذه القناة خاصة، أرسل الآن رابط الدعوة الخاص بها "
+                "(يبدأ بـ <code>https://t.me/</code>)."
+            )
+            return True
+
+        # ---------------- رابط دعوة قناة خاصة ----------------
+        if action == "add_channel_link":
+
+            if not text.startswith("https://t.me/"):
+                bot.send_message(
+                    ADMIN_ID,
+                    "❌ الرابط غير صحيح، يجب أن يبدأ بـ "
+                    "<code>https://t.me/</code>"
+                )
+                return True
+
+            save_channel(state["chat_id"], state["title"], text)
+            admin_state.pop(ADMIN_ID, None)
+
+            bot.send_message(
+                ADMIN_ID,
+                f"✅ تمت إضافة <b>{esc(state['title'])}</b> "
+                f"إلى الاشتراك الإجباري."
+            )
+            send_force_sub_menu()
+            return True
+
+        return True
+
+    # ---------------- رد الأدمن بالـ Reply ----------------
+    if message.reply_to_message:
+        target_id = get_support_user(message.reply_to_message.message_id)
+
+        if target_id:
+            send_admin_reply(message, target_id)
+            return True
+
+    return False
+
+
+# =========================================================
+# موزّع الرسائل
+# =========================================================
+
+
+@bot.message_handler(
+    func=lambda message: message.chat.type == "private",
+    content_types=ALL_CONTENT_TYPES
+)
+def message_router(message):
+
+    user_id = message.from_user.id
+
+    if user_id == ADMIN_ID and handle_admin_message(message):
+        return
+
+    if user_id in user_data:
+        handle_application_message(message)
+        return
+
+    if user_id in support_mode:
+        handle_support_message(message)
+        return
+
+
+# =========================================================
+# الإحصائيات
+# =========================================================
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "stats")
+def statistics(call):
+
+    if not is_admin_call(call):
+        return
+
+    def count(where=""):
+        row = q_one(f"SELECT COUNT(*) AS c FROM applications {where}")
+        return row["c"]
+
+    total = count()
+    pending = count("WHERE status = 'pending'")
+    approved = count("WHERE status = 'approved'")
+    rejected = count("WHERE status = 'rejected'")
+
+    users_total = q_one("SELECT COUNT(*) AS c FROM fw_users")["c"]
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        ADMIN_ID,
+        f"""
+<b>📊 إحصائيات تيم الفوارس</b>
+
+━━━━━━━━━━━━━━━━━━
+
+👥 مستخدمو البوت:
+<b>{users_total}</b>
+
+📋 جميع الطلبات:
+<b>{total}</b>
+
+⏳ قيد المراجعة:
+<b>{pending}</b>
+
+✅ المقبولة:
+<b>{approved}</b>
+
+❌ المرفوضة:
+<b>{rejected}</b>
+
+━━━━━━━━━━━━━━━━━━
+"""
+    )
+
+
+# =========================================================
+# تشغيل البوت
+# =========================================================
+
+if __name__ == "__main__":
+
+    print("================================")
+    print("⚔️ بوت تيم الفوارس يعمل الآن")
+    print("================================")
+
+    bot.infinity_polling(skip_pending=True)
